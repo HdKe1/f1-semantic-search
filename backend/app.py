@@ -65,8 +65,8 @@ if MODEL_PATH is None:
         MODEL_PATH = "all-MiniLM-L6-v2"
 
 print(f"Loading model from: {MODEL_PATH}")
-model = SentenceTransformer(MODEL_PATH)
-doc_embeddings = model.encode(corpus, convert_to_tensor=True)
+model = SentenceTransformer(MODEL_PATH, backend="onnx")
+doc_embeddings = model.encode(corpus, convert_to_tensor=False)
 print(f"Loaded {len(drivers)} drivers, embeddings ready.")
 
 # ---------------------------------------------------------------------------
@@ -122,7 +122,7 @@ def best_fuzzy_match(query: str, terms: list[str]) -> float:
 
 
 def hybrid_rank(query: str, top_k: int = 10) -> list[tuple[int, float]]:
-    query_embedding = model.encode(query, convert_to_tensor=True)
+    query_embedding = model.encode(query, convert_to_tensor=False)
     embed_scores = util.cos_sim(query_embedding, doc_embeddings)[0].tolist()
 
     results = []
