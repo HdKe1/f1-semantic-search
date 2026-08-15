@@ -1,16 +1,20 @@
 """
 FastAPI backend for F1 Driver Semantic Search.
 
-Uses Hugging Face Inference API for embeddings (no local model loading).
-Expects drivers_v2.json in the same directory (or parent directory).
+Uses pre-computed embeddings for drivers AND a local cosine similarity
+search. No external API calls at runtime.
 
-Run with: uvicorn app:app --reload --port 5001
+Query embeddings are computed locally using a lightweight approach:
+we pre-compute embeddings for all possible curated terms and use
+fuzzy + keyword matching for everything else.
+
+Run locally: python app.py
+Deploy: set PORT env var (Render sets this automatically)
 """
 
 import os
 import json
 import difflib
-import httpx
 import numpy as np
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,13 +33,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ---------------------------------------------------------------------------
-# Hugging Face Inference API config
-# ---------------------------------------------------------------------------
-HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
-HF_MODEL = os.environ.get("HF_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-HF_API_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/{HF_MODEL}"
 
 # ---------------------------------------------------------------------------
 # Load data
@@ -60,63 +57,69 @@ ids = [d["id"] for d in drivers]
 corpus = [d["vibe_embedding_text"] for d in drivers]
 
 # ---------------------------------------------------------------------------
-# Embedding via HF Inference API
+# Load pre-computed embeddings
 # ---------------------------------------------------------------------------
-def get_headers():
-    headers = {"Content-Type": "application/json"}
-    if HF_API_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
-    return headers
-
-
-async def get_embeddings(texts: list[str]) -> np.ndarray:
-    """Get embeddings from HF Inference API."""
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            HF_API_URL,
-            headers=get_headers(),
-            json={"inputs": texts, "options": {"wait_for_model": True}},
+EMBEDDINGS_PATH = os.environ.get("EMBEDDINGS_JSON", None)
+if EMBEDDINGS_PATH is None:
+    if os.path.exists("embeddings.json"):
+        EMBEDDINGS_PATH = "embeddings.json"
+    elif os.path.exists("../embeddings.json"):
+        EMBEDDINGS_PATH = "../embeddings.json"
+    else:
+        raise FileNotFoundError(
+            "embeddings.json not found. Run: python precompute_embeddings.py"
         )
-        response.raise_for_status()
-        return np.array(response.json())
 
+with open(EMBEDDINGS_PATH) as f:
+    embeddings_data = json.load(f)
+
+doc_embeddings = np.array(embeddings_data["embeddings"])
+
+# Also load query term embeddings (pre-computed for common search terms)
+query_term_embeddings = {}
+if "query_terms" in embeddings_data:
+    for term, emb in embeddings_data["query_terms"].items():
+        query_term_embeddings[term.lower()] = np.array(emb)
+
+print(f"Loaded {len(drivers)} drivers, {doc_embeddings.shape[1]}-dim embeddings.")
+print(f"Loaded {len(query_term_embeddings)} pre-computed query term embeddings.")
+
+# ---------------------------------------------------------------------------
+# Similarity functions
+# ---------------------------------------------------------------------------
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Compute cosine similarity between vector a and matrix b."""
-    a_norm = a / np.linalg.norm(a)
-    b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
+    a_norm = a / (np.linalg.norm(a) + 1e-10)
+    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-10)
     return np.dot(b_norm, a_norm)
 
 
-# ---------------------------------------------------------------------------
-# Pre-compute driver embeddings at startup
-# ---------------------------------------------------------------------------
-doc_embeddings: np.ndarray | None = None
+def get_query_embedding(query: str) -> np.ndarray | None:
+    """
+    Try to find a pre-computed embedding for the query.
+    Checks exact match first, then finds the closest pre-computed term.
+    """
+    query_lower = query.lower().strip()
 
+    # Exact match
+    if query_lower in query_term_embeddings:
+        return query_term_embeddings[query_lower]
 
-@app.on_event("startup")
-async def startup_event():
-    """Compute driver embeddings once at startup via HF API (with retries)."""
-    global doc_embeddings
-    import asyncio
+    # Find best matching pre-computed term via fuzzy match
+    best_term = None
+    best_ratio = 0.0
+    for term in query_term_embeddings:
+        ratio = difflib.SequenceMatcher(None, query_lower, term).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_term = term
 
-    print(f"Computing embeddings for {len(corpus)} drivers via HF API ({HF_MODEL})...")
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            doc_embeddings = await get_embeddings(corpus)
-            print(f"Embeddings ready: shape {doc_embeddings.shape}")
-            return
-        except Exception as e:
-            wait = 2 ** attempt
-            print(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
-            if attempt < max_retries - 1:
-                print(f"Retrying in {wait}s...")
-                await asyncio.sleep(wait)
-            else:
-                print("WARNING: Could not compute embeddings at startup. "
-                      "They will be computed on first request.")
+    # Only use if it's a close match (>70% similar)
+    if best_ratio > 0.7 and best_term:
+        return query_term_embeddings[best_term]
 
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -171,13 +174,16 @@ def best_fuzzy_match(query: str, terms: list[str]) -> float:
     return best
 
 
-async def hybrid_rank(query: str, top_k: int = 10) -> list[tuple[int, float]]:
-    global doc_embeddings
-    if doc_embeddings is None:
-        doc_embeddings = await get_embeddings(corpus)
+def hybrid_rank(query: str, top_k: int = 10) -> list[tuple[int, float]]:
+    """Rank drivers using semantic + fuzzy + nationality matching."""
 
-    query_embedding = (await get_embeddings([query]))[0]
-    embed_scores = cosine_similarity(query_embedding, doc_embeddings).tolist()
+    # Try to get semantic scores from pre-computed query embeddings
+    query_embedding = get_query_embedding(query)
+    if query_embedding is not None:
+        embed_scores = cosine_similarity(query_embedding, doc_embeddings).tolist()
+    else:
+        # No semantic embedding available — use fuzzy matching only
+        embed_scores = [0.0] * len(drivers)
 
     results = []
     for i, driver in enumerate(drivers):
@@ -196,11 +202,11 @@ async def hybrid_rank(query: str, top_k: int = 10) -> list[tuple[int, float]]:
 # API Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/api/search")
-async def search(q: str = Query(default="", description="Search query"), top_k: int = Query(default=5, ge=1, le=50)):
+def search(q: str = Query(default="", description="Search query"), top_k: int = Query(default=5, ge=1, le=50)):
     if not q.strip():
         return {"results": [], "query": ""}
 
-    ranked = await hybrid_rank(q.strip(), top_k=top_k)
+    ranked = hybrid_rank(q.strip(), top_k=top_k)
 
     results = []
     for idx, score in ranked:
@@ -222,9 +228,10 @@ async def search(q: str = Query(default="", description="Search query"), top_k: 
 def health():
     return {
         "status": "ok",
-        "model": HF_MODEL,
+        "model": "pre-computed (all-MiniLM-L6-v2)",
         "drivers_loaded": len(drivers),
-        "embeddings_ready": doc_embeddings is not None,
+        "embedding_dim": doc_embeddings.shape[1],
+        "query_terms_loaded": len(query_term_embeddings),
     }
 
 
