@@ -96,11 +96,27 @@ doc_embeddings: np.ndarray | None = None
 
 @app.on_event("startup")
 async def startup_event():
-    """Compute driver embeddings once at startup via HF API."""
+    """Compute driver embeddings once at startup via HF API (with retries)."""
     global doc_embeddings
+    import asyncio
+
     print(f"Computing embeddings for {len(corpus)} drivers via HF API ({HF_MODEL})...")
-    doc_embeddings = await get_embeddings(corpus)
-    print(f"Embeddings ready: shape {doc_embeddings.shape}")
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            doc_embeddings = await get_embeddings(corpus)
+            print(f"Embeddings ready: shape {doc_embeddings.shape}")
+            return
+        except Exception as e:
+            wait = 2 ** attempt
+            print(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                print(f"Retrying in {wait}s...")
+                await asyncio.sleep(wait)
+            else:
+                print("WARNING: Could not compute embeddings at startup. "
+                      "They will be computed on first request.")
+
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +172,10 @@ def best_fuzzy_match(query: str, terms: list[str]) -> float:
 
 
 async def hybrid_rank(query: str, top_k: int = 10) -> list[tuple[int, float]]:
+    global doc_embeddings
+    if doc_embeddings is None:
+        doc_embeddings = await get_embeddings(corpus)
+
     query_embedding = (await get_embeddings([query]))[0]
     embed_scores = cosine_similarity(query_embedding, doc_embeddings).tolist()
 
@@ -213,4 +233,5 @@ def health():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=5001, reload=True)
+    port = int(os.environ.get("PORT", 5001))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
